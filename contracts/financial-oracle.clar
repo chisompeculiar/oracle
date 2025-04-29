@@ -12,10 +12,14 @@
 (define-constant RESP-REBATE-DENIED (err u107))
 (define-constant RESP-INVALID-TIMEFRAME (err u108))
 (define-constant RESP-TRANSFER-ERROR (err u109))
+(define-constant RESP-INVALID-INPUT (err u110)) ;; New response code for input validation
 
 ;; System variables
 (define-data-var operator principal tx-sender)
 (define-data-var baseline-threshold uint u100) ;; Minimum calculable amount in base currency
+
+;; Valid currency list
+(define-data-var valid-currencies (list 20 (string-ascii 10)) (list ))
 
 ;; Forex data (scaled by 1e8)
 (define-map forex-rates
@@ -69,6 +73,16 @@
             transaction-currency: (string-ascii 10)
         })
     }
+)
+
+;; Helper function to check if a currency is valid
+(define-private (is-valid-currency (currency (string-ascii 10)))
+    (is-some (index-of (var-get valid-currencies) currency))
+)
+
+;; Helper function to check if adjustment code exists
+(define-private (is-valid-adjustment-code (adjustment-code (string-ascii 10)))
+    (is-some (map-get? adjustment-factors { adjustment-code: adjustment-code }))
 )
 
 ;; Read-only functions for data retrieval
@@ -143,10 +157,16 @@
         adjustment)
 )
 
-;; Administrative functions
+;; Administrative functions - FIXED to validate inputs
 (define-public (update-forex-rate (currency-symbol (string-ascii 10)) (new-rate uint))
     (begin
+        ;; Authorization check
         (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+        ;; Input validation
+        (asserts! (is-valid-currency currency-symbol) RESP-UNSUPPORTED-CURRENCY)
+        (asserts! (> new-rate u0) RESP-INVALID-VALUE)
+        
+        ;; Now it's safe to update the map
         (ok (map-set forex-rates
             { currency-symbol: currency-symbol }
             { rate-value: new-rate,
@@ -156,11 +176,33 @@
     )
 )
 
+;; Add a new currency to the valid currencies list
+(define-public (add-supported-currency (currency-symbol (string-ascii 10)))
+    (begin
+        (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+        (asserts! (not (is-valid-currency currency-symbol)) RESP-INVALID-INPUT)
+        (asserts! (< (len (var-get valid-currencies)) u20) RESP-INVALID-INPUT)
+        
+        (ok (var-set valid-currencies 
+            (unwrap! (as-max-len? (append (var-get valid-currencies) currency-symbol) u20) 
+            RESP-INVALID-INPUT)))
+    )
+)
+
 (define-public (register-adjustment-type (adjustment-code (string-ascii 10)) (adjustment-label (string-ascii 64)) 
                (max-value uint) (adjustment-rate uint) (verification-required bool))
     (begin
+        ;; Authorization check
         (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+        ;; Input validation
         (asserts! (<= adjustment-rate u100) RESP-RATE-OUT-OF-BOUNDS)
+        (asserts! (> max-value u0) RESP-INVALID-VALUE)
+        (asserts! (> (len adjustment-code) u0) RESP-INVALID-INPUT)
+        (asserts! (> (len adjustment-label) u0) RESP-INVALID-INPUT)
+        ;; Additional check to prevent duplicate adjustment codes (optional)
+        (asserts! (not (is-valid-adjustment-code adjustment-code)) RESP-INVALID-ADJUSTMENT)
+        
+        ;; Now it's safe to update the map
         (ok (map-set adjustment-factors
             { adjustment-code: adjustment-code }
             { adjustment-label: adjustment-label,
@@ -186,7 +228,11 @@
             (get-user-profile tx-sender)))
     )
         (begin
+            ;; Input validation
+            (asserts! (is-valid-adjustment-code adjustment-code) RESP-INVALID-ADJUSTMENT)
             (asserts! (<= adjustment-value (get max-adjustment-value adjustment-details)) RESP-INVALID-VALUE)
+            (asserts! (> adjustment-value u0) RESP-INVALID-VALUE)
+            
             (ok (map-set user-profiles
                 tx-sender
                 {
@@ -209,66 +255,102 @@
     )
 )
 
-;; Modified approve-adjustment-request function
+;; Modified approve-adjustment-request function - properly validates user input
 (define-public (approve-adjustment-request (user principal) (adjustment-index uint))
-    (let (
-        (user-profile (unwrap! (get-user-profile user) RESP-RATE-UNAVAILABLE))
-        (current-adjustments (get applied-adjustments user-profile))
-    )
-        (begin
-            (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+    (begin
+        ;; Authorization check
+        (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+        
+        ;; Validate user profile exists
+        (let (
+            (user-profile (unwrap! (get-user-profile user) RESP-RATE-UNAVAILABLE))
+            (current-adjustments (get applied-adjustments user-profile))
+        )
+            ;; Validate adjustment index
             (asserts! (< adjustment-index (len current-adjustments)) RESP-INVALID-ADJUSTMENT)
             
-            (ok (map-set user-profiles
-                user
-                {
-                    total-fees-paid: (get total-fees-paid user-profile),
-                    total-rebates-received: (get total-rebates-received user-profile),
-                    latest-transaction: (get latest-transaction user-profile),
-                    user-segment: (get user-segment user-profile),
-                    applied-adjustments: (unwrap-panic (as-max-len? 
-                        (map update-adjustment-status 
-                            (list adjustment-index)
-                            (list u0)
-                            current-adjustments
-                            (list adjustment-index))
-                        u20)),
-                    activity-log: (get activity-log user-profile)
-                }
-            ))
+            ;; Create new user profile with validated data
+            (let (
+                (validated-fees-paid (get total-fees-paid user-profile))
+                (validated-rebates (get total-rebates-received user-profile))
+                (validated-last-tx (get latest-transaction user-profile))
+                (validated-segment (get user-segment user-profile))
+                (validated-log (get activity-log user-profile))
+                (updated-adjustments (unwrap-panic (as-max-len? 
+                    (map update-adjustment-status 
+                        (list adjustment-index)
+                        (list u0)
+                        current-adjustments
+                        (list adjustment-index))
+                    u20)))
+            )
+                ;; Now use validated data for the map-set operation
+                (ok (map-set user-profiles
+                    user
+                    {
+                        total-fees-paid: validated-fees-paid,
+                        total-rebates-received: validated-rebates,
+                        latest-transaction: validated-last-tx,
+                        user-segment: validated-segment,
+                        applied-adjustments: updated-adjustments,
+                        activity-log: validated-log
+                    }
+                ))
+            )
         )
     )
 )
 
-;; Modified issue-rebate function to use native STX transfer
+;; Modified issue-rebate function to use native STX transfer - with proper validation
 (define-public (issue-rebate (user principal) (rebate-amount uint) (rebate-currency (string-ascii 10)))
-    (let (
-        (user-profile (unwrap! (get-user-profile user) RESP-RATE-UNAVAILABLE))
-        (converted-rebate-amount (unwrap! (convert-currency rebate-amount rebate-currency "STX") RESP-UNSUPPORTED-CURRENCY))
-    )
-        (begin
-            (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+    (begin
+        ;; Authorization check first
+        (asserts! (is-eq tx-sender (var-get operator)) RESP-UNAUTHORIZED)
+        ;; Validate currency before any operations
+        (asserts! (is-valid-currency rebate-currency) RESP-UNSUPPORTED-CURRENCY)
+        ;; Validate amount
+        (asserts! (> rebate-amount u0) RESP-INVALID-VALUE)
+        
+        ;; Get and validate user profile
+        (let (
+            (user-profile (unwrap! (get-user-profile user) RESP-RATE-UNAVAILABLE))
+            (converted-rebate-amount (unwrap! (convert-currency rebate-amount rebate-currency "STX") RESP-UNSUPPORTED-CURRENCY))
+        )
+            ;; Validate rebate amount against user's fees
             (asserts! (<= converted-rebate-amount (get total-fees-paid user-profile)) RESP-REBATE-DENIED)
-            ;; Use stx-transfer instead of contract-call
-            (try! (stx-transfer? converted-rebate-amount (var-get operator) user))
-            (ok (map-set user-profiles
-                user
-                {
-                    total-fees-paid: (get total-fees-paid user-profile),
-                    total-rebates-received: (+ (get total-rebates-received user-profile) converted-rebate-amount),
-                    latest-transaction: (get latest-transaction user-profile),
-                    user-segment: (get user-segment user-profile),
-                    applied-adjustments: (get applied-adjustments user-profile),
-                    activity-log: (unwrap-panic (as-max-len?
-                        (append (get activity-log user-profile)
-                            { 
-                                transaction-value: (- u0 converted-rebate-amount),
-                                timestamp: block-height,
-                                transaction-currency: rebate-currency 
-                            })
-                        u50))
-                }
-            ))
+            
+            ;; Extract and validate all user profile fields
+            (let (
+                (validated-fees-paid (get total-fees-paid user-profile))
+                (validated-rebates (get total-rebates-received user-profile))
+                (validated-last-tx (get latest-transaction user-profile))
+                (validated-segment (get user-segment user-profile))
+                (validated-adjustments (get applied-adjustments user-profile))
+                (validated-log (get activity-log user-profile))
+                (new-rebate-total (+ validated-rebates converted-rebate-amount))
+                (validated-tx-entry {
+                    transaction-value: (- u0 converted-rebate-amount),
+                    timestamp: block-height,
+                    transaction-currency: rebate-currency
+                })
+                (updated-log (unwrap-panic (as-max-len? (append validated-log validated-tx-entry) u50)))
+            )
+                ;; Process STX transfer
+                (try! (stx-transfer? converted-rebate-amount (var-get operator) user))
+                
+                ;; Now use validated data for the map-set operation
+                (ok (map-set user-profiles
+                    user
+                    {
+                        total-fees-paid: validated-fees-paid,
+                        total-rebates-received: new-rebate-total,
+                        latest-transaction: validated-last-tx,
+                        user-segment: validated-segment, 
+                        applied-adjustments: validated-adjustments,
+                        activity-log: updated-log
+                    }
+                ))
+            )
         )
     )
 )
